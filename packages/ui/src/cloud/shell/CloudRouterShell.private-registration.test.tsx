@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { savePersistedActiveServer } from "../../state/persistence";
 import { useSessionAuth } from "../lib/use-session-auth";
 import {
+  getPrivateCloudRegistrationSnapshot,
   resetPrivateCloudRegistrationForTests,
   setPrivateCloudLoadForTests,
 } from "../private-cloud-registration";
@@ -21,7 +22,7 @@ import {
 } from "../public-pages/lib/login-return-to";
 import { registerPublicCloudSurfaces } from "../register-public";
 import { CloudRouterShell } from "./CloudRouterShell";
-import { registerCloudRoute } from "./cloud-route-registry";
+import { getCloudRoute, registerCloudRoute } from "./cloud-route-registry";
 import { ManagedCloudPage } from "./ManagedCloudPage";
 
 vi.mock("./StewardProvider", async (importOriginal) => {
@@ -108,6 +109,9 @@ describe("CloudRouterShell private Cloud registration UI", () => {
   });
 
   it("keeps registered Cloud routes on the hosted management renderer", async () => {
+    // Managed routes wait on the private-registration barrier (#29283); the
+    // route below stands in for one the private load already published.
+    setPrivateCloudLoadForTests(async () => {});
     registerCloudRoute({
       path: "cloud/billing/hosted-test",
       group: "cloud",
@@ -185,6 +189,65 @@ describe("CloudRouterShell private Cloud registration UI", () => {
       expect(screen.getByTestId("app-probe")).toBeTruthy();
     });
     expect(attempts).toBe(2);
+  });
+
+  it("keeps a newly registered Billing route behind the pending private-registration barrier", async () => {
+    let publishBillingRoute!: () => void;
+    let completePrivateLoad!: () => void;
+    const billingRoutePublished = new Promise<void>((resolve) => {
+      publishBillingRoute = resolve;
+    });
+    const privateLoadCompleted = new Promise<void>((resolve) => {
+      completePrivateLoad = resolve;
+    });
+
+    window.history.replaceState({}, "", "/cloud/billing/payments/pay_cold");
+
+    setPrivateCloudLoadForTests(async () => {
+      await billingRoutePublished;
+      registerCloudRoute({
+        path: "cloud/billing/payments/:id",
+        group: "cloud",
+        element: function RegisteredBillingPaymentDetail() {
+          return <div data-testid="registered-billing-payment-detail" />;
+        },
+      });
+      await privateLoadCompleted;
+    });
+
+    render(<CloudRouterShell appElement={<div data-testid="app-probe" />} />);
+
+    expect(document.querySelector("[aria-busy='true']")).toBeTruthy();
+    expect(screen.queryByTestId("app-probe")).toBeNull();
+
+    await act(async () => {
+      publishBillingRoute();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(getCloudRoute("cloud/billing/payments/:id")).toBeDefined();
+    expect(getPrivateCloudRegistrationSnapshot().status).toBe("pending");
+    expect(screen.queryByTestId("app-probe")).toBeNull();
+    expect(
+      screen.queryByTestId("registered-billing-payment-detail"),
+    ).toBeNull();
+    expect(document.querySelector("[aria-busy='true']")).toBeTruthy();
+    expect(window.location.pathname).toBe("/cloud/billing/payments/pay_cold");
+
+    await act(async () => {
+      completePrivateLoad();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("app-probe")).toBeTruthy();
+    });
+    expect(window.location.pathname).toBe("/cloud/billing/payments/pay_cold");
+    expect(
+      screen.queryByTestId("registered-billing-payment-detail"),
+    ).toBeNull();
   });
 });
 
