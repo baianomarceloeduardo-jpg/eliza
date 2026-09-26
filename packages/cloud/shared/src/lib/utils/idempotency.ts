@@ -13,35 +13,6 @@ import { logger } from "./logger";
 const IDEMPOTENCY_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
 /**
- * Check if a message has already been processed within the TTL window.
- * Fails open (returns false) on errors to avoid dropping messages.
- */
-export async function isAlreadyProcessed(key: string): Promise<boolean> {
-  try {
-    const [existing] = await dbRead
-      .select({ expires_at: idempotencyKeys.expires_at })
-      .from(idempotencyKeys)
-      .where(eq(idempotencyKeys.key, key))
-      .limit(1);
-
-    if (!existing) return false;
-
-    // Check if expired - delete and return false if so
-    if (existing.expires_at < new Date()) {
-      await dbWrite.delete(idempotencyKeys).where(eq(idempotencyKeys.key, key));
-      return false;
-    }
-
-    return true;
-  } catch {
-    logger.error("[Idempotency] Error checking key", {
-      failureClass: "idempotency_store_failed",
-    });
-    return false;
-  }
-}
-
-/**
  * Atomically claim a key for processing. Returns true if THIS caller claimed it.
  * Uses INSERT ... ON CONFLICT DO NOTHING so only one concurrent caller wins.
  * Unlike isAlreadyProcessed + markAsProcessed, this is a single atomic operation
@@ -81,23 +52,6 @@ export async function releaseProcessingClaim(key: string): Promise<void> {
     await dbWrite.delete(idempotencyKeys).where(eq(idempotencyKeys.key, key));
   } catch {
     logger.error("[Idempotency] Error releasing claim", {
-      failureClass: "idempotency_store_failed",
-    });
-  }
-}
-
-/**
- * Mark a message as processed. Uses upsert to handle race conditions.
- */
-export async function markAsProcessed(key: string, source = "unknown"): Promise<void> {
-  try {
-    const expires_at = new Date(Date.now() + IDEMPOTENCY_TTL_MS);
-    await dbWrite
-      .insert(idempotencyKeys)
-      .values({ key, source, expires_at })
-      .onConflictDoUpdate({ target: idempotencyKeys.key, set: { expires_at } });
-  } catch {
-    logger.error("[Idempotency] Error marking key", {
       failureClass: "idempotency_store_failed",
     });
   }

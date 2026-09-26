@@ -19,7 +19,10 @@ import {
   parseBlooioWebhookEvent,
   verifyBlooioSignature,
 } from "@/lib/utils/blooio-api";
-import { isAlreadyProcessed, markAsProcessed } from "@/lib/utils/idempotency";
+import {
+  releaseProcessingClaim,
+  tryClaimForProcessing,
+} from "@/lib/utils/idempotency";
 import { logger } from "@/lib/utils/logger";
 import type { AppContext, AppEnv } from "@/types/cloud-worker-env";
 
@@ -103,9 +106,13 @@ async function handleBlooioWebhook(c: AppContext): Promise<Response> {
       return c.json({ error: "Inbound message ID is required" }, 400);
     }
 
-    if (payload.message_id) {
-      const idempotencyKey = `blooio:${payload.message_id}`;
-      if (await isAlreadyProcessed(idempotencyKey)) {
+    // Claim atomically before handling so an overlapping redelivery of the same
+    // message cannot run inference or send a reply twice.
+    const idempotencyKey = payload.message_id
+      ? `blooio:${payload.message_id}`
+      : null;
+    if (idempotencyKey) {
+      if (!(await tryClaimForProcessing(idempotencyKey, "blooio"))) {
         logger.info("[BlooioWebhook] Duplicate message, skipping", {
           orgId,
         });
@@ -128,9 +135,15 @@ async function handleBlooioWebhook(c: AppContext): Promise<Response> {
     // Handle different event types
     switch (payload.event) {
       case "message.received":
-        await handleIncomingMessage(orgId, payload, (promise) =>
-          c.executionCtx.waitUntil(promise),
-        );
+        try {
+          await handleIncomingMessage(orgId, payload, (promise) =>
+            c.executionCtx.waitUntil(promise),
+          );
+        } catch (error) {
+          // Release so the provider's retry of a failed delivery can proceed.
+          if (idempotencyKey) await releaseProcessingClaim(idempotencyKey);
+          throw error;
+        }
         break;
 
       case "message.sent":
@@ -161,11 +174,6 @@ async function handleBlooioWebhook(c: AppContext): Promise<Response> {
         logger.info("[BlooioWebhook] Unhandled event type", {
           orgId,
         });
-    }
-
-    // Mark message as processed after successful handling (only if we have a message_id)
-    if (payload.message_id) {
-      await markAsProcessed(`blooio:${payload.message_id}`, "blooio");
     }
 
     return c.json({ success: true });

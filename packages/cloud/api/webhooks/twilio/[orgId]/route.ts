@@ -18,7 +18,10 @@ import {
 import { phoneErrorDiagnostic } from "@/lib/services/phone-error-diagnostics";
 import { twilioAutomationService } from "@/lib/services/twilio-automation";
 import { usageService } from "@/lib/services/usage";
-import { isAlreadyProcessed, markAsProcessed } from "@/lib/utils/idempotency";
+import {
+  releaseProcessingClaim,
+  tryClaimForProcessing,
+} from "@/lib/utils/idempotency";
 import { logger } from "@/lib/utils/logger";
 import {
   extractMediaUrls,
@@ -143,8 +146,10 @@ async function handleTwilioWebhook(c: AppContext): Promise<Response> {
       }
     }
 
+    // Claim atomically before any inference, outbound send, or usage write so
+    // an overlapping redelivery of the same MessageSid cannot run twice.
     const idempotencyKey = `twilio:${event.MessageSid}`;
-    if (await isAlreadyProcessed(idempotencyKey)) {
+    if (!(await tryClaimForProcessing(idempotencyKey, "twilio"))) {
       logger.info("[TwilioWebhook] Duplicate message, skipping", {
         orgId,
       });
@@ -163,8 +168,13 @@ async function handleTwilioWebhook(c: AppContext): Promise<Response> {
       numMedia: extractMediaUrls(event).length,
     });
 
-    await handleIncomingMessage(c, orgId, event);
-    await markAsProcessed(idempotencyKey, "twilio");
+    try {
+      await handleIncomingMessage(c, orgId, event);
+    } catch (error) {
+      // Release so Twilio's retry of a genuinely failed delivery can proceed.
+      await releaseProcessingClaim(idempotencyKey);
+      throw error;
+    }
 
     return c.body(
       '<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
