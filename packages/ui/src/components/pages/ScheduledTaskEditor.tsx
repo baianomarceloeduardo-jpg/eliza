@@ -4,9 +4,10 @@
  *
  * Scheduled items are owned by the LifeOps runner (the single scheduling
  * spine), NOT the workflow CRUD. So this panel routes its actions to the
- * scheduled-item verb endpoints via `client.applyScheduledTask` — run
- * (acknowledge), complete, dismiss, snooze — rather than the workflow
- * create/update path. It is a thin verb surface, not a full schedule editor:
+ * scheduled-item endpoints — "Run now" fires a manual item through
+ * `client.fireScheduledTask` (the runner's strict-fire path); acknowledge,
+ * complete, dismiss and snooze go through `client.applyScheduledTask` — rather
+ * than the workflow create/update path. It is a thin verb surface, not a full schedule editor:
  * the schedule itself is defined by the seeded definition / chat, consistent
  * with the one-scheduler rule. The code type stays `ScheduledTask` (frozen
  * contract); only the prose/UI say "scheduled item".
@@ -15,7 +16,10 @@
 import { Bell, CalendarClock, Check, Clock, X } from "lucide-react";
 import { useCallback, useState } from "react";
 import { client } from "../../api";
-import type { ScheduledTaskVerbName } from "../../api/client-scheduled-tasks";
+import type {
+  ScheduledTaskFireResult,
+  ScheduledTaskVerbName,
+} from "../../api/client-scheduled-tasks";
 import type { AutomationItem } from "../../api/client-types-config";
 import { useTranslation } from "../../state/TranslationContext.hooks";
 import { scheduledTaskScheduleLabel } from "../../utils/scheduled-task-to-automation";
@@ -32,6 +36,8 @@ export interface ScheduledTaskEditorProps {
 
 const SNOOZE_MINUTES = 60;
 
+type EditorAction = ScheduledTaskVerbName | "fire";
+
 export function ScheduledTaskEditor({
   item,
   onApplied,
@@ -39,14 +45,16 @@ export function ScheduledTaskEditor({
 }: ScheduledTaskEditorProps) {
   const { t } = useTranslation();
   const task = item.scheduledTask;
-  const [busy, setBusy] = useState<ScheduledTaskVerbName | null>(null);
+  const [busy, setBusy] = useState<EditorAction | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const apply = useCallback(
     async (verb: ScheduledTaskVerbName, payload?: Record<string, unknown>) => {
       if (!task) return;
       setBusy(verb);
       setError(null);
+      setNotice(null);
       try {
         await client.applyScheduledTask(task.taskId, verb, payload);
         onApplied?.();
@@ -64,6 +72,33 @@ export function ScheduledTaskEditor({
     },
     [task, onApplied, t],
   );
+
+  const fire = useCallback(async () => {
+    if (!task) return;
+    setBusy("fire");
+    setError(null);
+    setNotice(null);
+    try {
+      const { fire: outcome } = await client.fireScheduledTask(task.taskId);
+      const message = describeFireOutcome(outcome, t);
+      if (outcome.kind === "fired") {
+        setNotice(message);
+        onApplied?.();
+      } else {
+        setError(message);
+      }
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? e.message
+          : t("scheduledtask.fireError", {
+              defaultValue: "Failed to run scheduled item.",
+            }),
+      );
+    } finally {
+      setBusy(null);
+    }
+  }, [task, onApplied, t]);
 
   if (!task) {
     return (
@@ -128,18 +163,28 @@ export function ScheduledTaskEditor({
         </div>
       </div>
 
-      {error && <div className="text-sm text-danger">{error}</div>}
+      {error && (
+        <div role="alert" className="text-sm text-danger">
+          {error}
+        </div>
+      )}
+      {notice && (
+        <div role="status" className="text-sm text-muted-strong">
+          {notice}
+        </div>
+      )}
 
       <div className="flex flex-wrap gap-2">
-        {/* Run now = acknowledge (fire the task immediately for manual/paused
-            starters like the seeded weekly review). */}
+        {/* Run now fires a manual starter (e.g. the seeded weekly review)
+            through the runner; other items are acknowledged once delivered. */}
         <Button
           variant="default"
           size="sm"
           disabled={busy !== null}
-          onClick={() => apply("acknowledge")}
+          aria-busy={busy === "fire"}
+          onClick={() => (isManual ? fire() : apply("acknowledge"))}
         >
-          <Bell className="mr-1  size-3.5" aria-hidden />
+          <Bell className="mr-1 size-3.5" aria-hidden />
           {isManual
             ? t("scheduledtask.runNow", { defaultValue: "Run now" })
             : t("scheduledtask.acknowledge", { defaultValue: "Acknowledge" })}
@@ -174,4 +219,35 @@ export function ScheduledTaskEditor({
       </div>
     </div>
   );
+}
+
+type Translate = ReturnType<typeof useTranslation>["t"];
+
+function describeFireOutcome(
+  outcome: ScheduledTaskFireResult,
+  t: Translate,
+): string {
+  switch (outcome.kind) {
+    case "fired":
+      return t("scheduledtask.fired", { defaultValue: "Ran just now." });
+    case "raced":
+      return t("scheduledtask.fireRaced", {
+        defaultValue: "It was already running. Refresh to see the result.",
+      });
+    case "skipped":
+      return t("scheduledtask.fireSkipped", {
+        defaultValue: "Not run: {{reason}}",
+        reason: outcome.reason ?? "skipped",
+      });
+    case "dispatch_deferred":
+      return t("scheduledtask.fireDeferred", {
+        defaultValue: "Delivery failed; it will retry at {{time}}.",
+        time: outcome.nextAttemptAtIso ?? "the next attempt",
+      });
+    case "dispatch_failed":
+      return t("scheduledtask.fireFailed", {
+        defaultValue: "Delivery failed: {{error}}",
+        error: outcome.error ?? "unknown error",
+      });
+  }
 }

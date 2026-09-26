@@ -2,9 +2,10 @@
 // @vitest-environment jsdom
 
 /**
- * jsdom tests for `ScheduledTaskEditor` over a mocked `applyScheduledTask` client:
- * verifies verb routing (run-now / acknowledge / snooze / complete / dismiss),
- * the correct label per task kind, and error surfacing when a verb fails.
+ * jsdom tests for `ScheduledTaskEditor` over a mocked scheduled-task client:
+ * verifies that "Run now" fires through the fire route, verb routing
+ * (acknowledge / snooze / complete / dismiss), the correct label per task kind,
+ * and error surfacing when a verb or fire fails.
  */
 import {
   cleanup,
@@ -18,17 +19,23 @@ import type { AutomationItem } from "../../api/client-types-config";
 import type { ScheduledTaskView } from "../../api/client-types-core";
 
 // The editor routes verbs to the scheduled-task endpoints via the typed client.
-const { applyScheduledTaskMock } = vi.hoisted(() => ({
+const { applyScheduledTaskMock, fireScheduledTaskMock } = vi.hoisted(() => ({
   applyScheduledTaskMock: vi.fn(),
+  fireScheduledTaskMock: vi.fn(),
 }));
 vi.mock("../../api", () => ({
-  client: { applyScheduledTask: applyScheduledTaskMock },
+  client: {
+    applyScheduledTask: applyScheduledTaskMock,
+    fireScheduledTask: fireScheduledTaskMock,
+  },
 }));
 // Translation: echo the defaultValue so we can assert on the English copy.
 vi.mock("../../state/TranslationContext.hooks", () => ({
   useTranslation: () => ({
-    t: (key: string, opts?: { defaultValue?: string }) =>
-      opts?.defaultValue ?? key,
+    t: (key: string, opts?: Record<string, unknown>) =>
+      String(opts?.defaultValue ?? key).replace(/\{\{(\w+)\}\}/g, (_, name) =>
+        String(opts?.[name] ?? ""),
+      ),
   }),
 }));
 
@@ -73,16 +80,53 @@ describe("ScheduledTaskEditor", () => {
   beforeEach(() => {
     applyScheduledTaskMock.mockReset();
     applyScheduledTaskMock.mockResolvedValue(undefined);
+    fireScheduledTaskMock.mockReset();
+    fireScheduledTaskMock.mockResolvedValue({
+      fire: { kind: "fired", task: null },
+    });
   });
   afterEach(() => {
     cleanup();
   });
 
-  it("shows 'Run now' for a manual (paused) starter and acknowledges it", async () => {
+  it("fires a manual (paused) starter through the fire route on 'Run now' (#31891)", async () => {
     const onApplied = vi.fn();
     render(<ScheduledTaskEditor item={item(task())} onApplied={onApplied} />);
 
     fireEvent.click(screen.getByText("Run now"));
+    await waitFor(() =>
+      expect(fireScheduledTaskMock).toHaveBeenCalledWith("t-1"),
+    );
+    await waitFor(() => expect(onApplied).toHaveBeenCalledTimes(1));
+    expect(screen.getByText("Ran just now.")).toBeTruthy();
+    expect(applyScheduledTaskMock).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a skipped fire outcome instead of reporting success", async () => {
+    fireScheduledTaskMock.mockResolvedValue({
+      fire: { kind: "skipped", reason: "global pause", task: null },
+    });
+    const onApplied = vi.fn();
+    render(<ScheduledTaskEditor item={item(task())} onApplied={onApplied} />);
+
+    fireEvent.click(screen.getByText("Run now"));
+    await waitFor(() =>
+      expect(screen.getByText("Not run: global pause")).toBeTruthy(),
+    );
+    expect(onApplied).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges a non-manual task", async () => {
+    render(
+      <ScheduledTaskEditor
+        item={item(
+          task({
+            trigger: { kind: "cron", expression: "0 8 * * *", tz: "UTC" },
+          }),
+        )}
+      />,
+    );
+    fireEvent.click(screen.getByText("Acknowledge"));
     await waitFor(() =>
       expect(applyScheduledTaskMock).toHaveBeenCalledWith(
         "t-1",
@@ -90,7 +134,7 @@ describe("ScheduledTaskEditor", () => {
         undefined,
       ),
     );
-    await waitFor(() => expect(onApplied).toHaveBeenCalledTimes(1));
+    expect(fireScheduledTaskMock).not.toHaveBeenCalled();
   });
 
   it("labels the run button 'Acknowledge' for a non-manual task", () => {
@@ -144,7 +188,7 @@ describe("ScheduledTaskEditor", () => {
     const onApplied = vi.fn();
     render(<ScheduledTaskEditor item={item(task())} onApplied={onApplied} />);
 
-    fireEvent.click(screen.getByText("Run now"));
+    fireEvent.click(screen.getByText("Complete"));
     await waitFor(() =>
       expect(screen.getByText("server rejected")).toBeTruthy(),
     );
