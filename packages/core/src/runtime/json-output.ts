@@ -230,15 +230,22 @@ export function stringifyForModel(value: unknown): string {
 /** Serialize diagnostic context without allowing hostile or cyclic values to mask the original event. */
 export function stringifyForDiagnostics(value: unknown): string {
 	if (typeof value === "string") return value;
-	const seen = new WeakSet<object>();
+	// Only a reference back to an open ancestor is a cycle; an object reached
+	// twice through sibling paths (a DAG) is serialized in full both times.
+	// JSON.stringify calls the replacer with the holder as `this`, so the
+	// ancestor path is the stack popped back to that holder.
+	const ancestors: unknown[] = [];
 	try {
 		const serialized = JSON.stringify(
 			value,
-			(_key, nestedValue: unknown) => {
+			function (this: unknown, _key, nestedValue: unknown) {
 				if (typeof nestedValue === "bigint") return `${nestedValue}n`;
 				if (nestedValue && typeof nestedValue === "object") {
-					if (seen.has(nestedValue)) return "[Circular]";
-					seen.add(nestedValue);
+					while (ancestors.length > 0 && ancestors.at(-1) !== this) {
+						ancestors.pop();
+					}
+					if (ancestors.includes(nestedValue)) return "[Circular]";
+					ancestors.push(nestedValue);
 				}
 				return nestedValue;
 			},
