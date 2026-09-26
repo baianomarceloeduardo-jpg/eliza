@@ -206,6 +206,39 @@ function effectiveMediaMime(
   return sniffed;
 }
 // ---------------------------------------------------------------------------
+// Atomic file writes
+// ---------------------------------------------------------------------------
+
+/**
+ * Write through a temporary sibling and rename it over `filePath`, so a
+ * content-addressed name is only ever observed complete. An interrupted write
+ * (ENOSPC, a crash) never leaves partial bytes under the final name; the
+ * temporary file is removed and the original failure propagates.
+ */
+function writeFileAtomicSync(filePath: string, data: Buffer | string): void {
+  const temporaryPath = `${filePath}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, data, { flag: "wx" });
+    fs.renameSync(temporaryPath, filePath);
+  } finally {
+    fs.rmSync(temporaryPath, { force: true });
+  }
+}
+
+/**
+ * A content-addressed name needs writing when it is absent or holds a byte
+ * length other than the payload's: the name is the hash of the full payload,
+ * so a length mismatch is a truncated leftover of an interrupted write.
+ */
+function storedFileNeedsWrite(
+  filePath: string,
+  expectedBytes: number,
+): boolean {
+  const stat = fs.statSync(filePath, { throwIfNoEntry: false });
+  return !stat?.isFile() || stat.size !== expectedBytes;
+}
+
+// ---------------------------------------------------------------------------
 // Size-capped eviction
 // ---------------------------------------------------------------------------
 export const DEFAULT_MEDIA_STORE_MAX_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
@@ -339,7 +372,7 @@ export function persistPrivateMediaBytes(
   const nonce = crypto.randomBytes(8).toString("hex");
   const fileName = `${hash}.private-${nonce}.${extForMime(mimeType)}`;
   const filePath = path.join(mediaDir(), fileName);
-  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, buffer);
+  writeFileAtomicSync(filePath, buffer);
   return { hash, fileName };
 }
 /** Read private media bytes; public media names and traversal are rejected. */
@@ -374,8 +407,8 @@ export function persistMediaBytes(
   const hash = crypto.createHash("sha256").update(buffer).digest("hex");
   const fileName = `${hash}.${extForMime(effectiveMime)}`;
   const filePath = path.join(mediaDir(), fileName);
-  if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, buffer);
+  if (storedFileNeedsWrite(filePath, buffer.length)) {
+    writeFileAtomicSync(filePath, buffer);
     maybeEvict();
   }
   return { url: `${MEDIA_URL_PREFIX}${fileName}`, hash, fileName };
@@ -585,7 +618,9 @@ export function writeStoredMediaFile(fileName: string, bytes: Buffer): boolean {
   if (path.dirname(filePath) !== mediaDir()) return false;
   try {
     fs.mkdirSync(mediaDir(), { recursive: true });
-    if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, bytes);
+    if (storedFileNeedsWrite(filePath, bytes.length)) {
+      writeFileAtomicSync(filePath, bytes);
+    }
     return true;
   } catch (err) {
     // error-policy:J2 context-adding rethrow — a failed restore write is data
@@ -699,7 +734,7 @@ export function pinBackgroundMedia(url: string): void {
   try {
     const pins = readBackgroundPins().filter((existing) => existing !== name);
     pins.push(name);
-    fs.writeFileSync(
+    writeFileAtomicSync(
       backgroundPinsPath(),
       JSON.stringify(pins.slice(-MAX_BACKGROUND_PINS)),
     );
